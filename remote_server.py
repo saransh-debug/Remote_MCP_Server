@@ -1,5 +1,7 @@
 import sqlite3
 import os
+import time
+
 from fastmcp import FastMCP
 
 mcp = FastMCP(name="Expense Tracker")
@@ -11,13 +13,39 @@ mcp = FastMCP(name="Expense Tracker")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Use /tmp for the SQLite database in the deployed environment.
-# NOTE: /tmp is writable, but its data may not survive redeployments.
-DB_PATH = os.path.join("/tmp", "expense.db")
+DB_PATH = os.path.join(BASE_DIR, "expense.db")
 
-# This file is read-only application data, so it can stay
-# alongside your source code.
-FILE_PATH = os.path.join(BASE_DIR, "expenses_json.json")
+FILE_PATH = os.path.join(
+    BASE_DIR,
+    "expenses_json.json"
+)
+
+
+# ============================================================
+# DATABASE CONNECTION
+# ============================================================
+
+def get_db():
+    """
+    Create a new SQLite connection for each request.
+
+    WAL allows multiple readers while a writer is active.
+    busy_timeout makes SQLite wait for a lock instead of
+    immediately throwing 'database is locked'.
+    """
+
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False
+    )
+
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    return conn
 
 
 # ============================================================
@@ -25,7 +53,9 @@ FILE_PATH = os.path.join(BASE_DIR, "expenses_json.json")
 # ============================================================
 
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+
+    with get_db() as conn:
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,7 +74,7 @@ init_db()
 
 
 # ============================================================
-# TOOLS
+# TOOL: ADD EXPENSE
 # ============================================================
 
 @mcp.tool
@@ -59,32 +89,59 @@ def add_expense(
     Add a new expense.
     """
 
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO expenses
-            (date, amount, category, subcategory, note)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                date,
-                amount,
-                category,
-                subcategory,
-                note
-            )
-        )
+    max_retries = 5
 
-        expense_id = cursor.lastrowid
+    for attempt in range(max_retries):
 
-        conn.commit()
+        try:
 
-    return {
-        "success": True,
-        "expense_id": expense_id,
-        "message": "Expense added successfully"
-    }
+            with get_db() as conn:
 
+                cursor = conn.execute(
+                    """
+                    INSERT INTO expenses
+                    (
+                        date,
+                        amount,
+                        category,
+                        subcategory,
+                        note
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        date,
+                        amount,
+                        category,
+                        subcategory,
+                        note
+                    )
+                )
+
+                expense_id = cursor.lastrowid
+
+                conn.commit()
+
+                return {
+                    "success": True,
+                    "expense_id": expense_id,
+                    "message": "Expense added successfully"
+                }
+
+        except sqlite3.OperationalError as e:
+
+            if "locked" not in str(e).lower():
+                raise
+
+            if attempt == max_retries - 1:
+                raise
+
+            time.sleep(0.1 * (attempt + 1))
+
+
+# ============================================================
+# TOOL: LIST EXPENSES
+# ============================================================
 
 @mcp.tool
 def list_expenses(
@@ -92,10 +149,10 @@ def list_expenses(
     end_date: str
 ):
     """
-    Gives the list of expenses between two dates.
+    Get expenses between two dates.
     """
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db() as conn:
 
         cursor = conn.execute(
             """
@@ -108,7 +165,7 @@ def list_expenses(
                 note
             FROM expenses
             WHERE date BETWEEN ? AND ?
-            ORDER BY id ASC
+            ORDER BY date ASC, id ASC
             """,
             (
                 start_date,
@@ -117,15 +174,21 @@ def list_expenses(
         )
 
         columns = [
-            description[0]
-            for description in cursor.description
+            column[0]
+            for column in cursor.description
         ]
+
+        rows = cursor.fetchall()
 
         return [
             dict(zip(columns, row))
-            for row in cursor.fetchall()
+            for row in rows
         ]
 
+
+# ============================================================
+# TOOL: SUMMARISE
+# ============================================================
 
 @mcp.tool
 def summarise(
@@ -134,17 +197,19 @@ def summarise(
     category: str = None
 ):
     """
-    Summarises expenses between two dates.
-    If category is provided, only that category is summarised.
+    Summarise expenses between two dates.
+
+    If category is provided, only that category
+    is included.
     """
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db() as conn:
 
         if category:
 
             cursor = conn.execute(
                 """
-                SELECT COALESCE(SUM(amount), 0)
+                SELECT SUM(amount)
                 FROM expenses
                 WHERE date BETWEEN ? AND ?
                 AND category = ?
@@ -160,7 +225,7 @@ def summarise(
 
             cursor = conn.execute(
                 """
-                SELECT COALESCE(SUM(amount), 0)
+                SELECT SUM(amount)
                 FROM expenses
                 WHERE date BETWEEN ? AND ?
                 """,
@@ -172,16 +237,11 @@ def summarise(
 
         total = cursor.fetchone()[0]
 
-    return {
-        "start_date": start_date,
-        "end_date": end_date,
-        "category": category,
-        "total": total
-    }
+        return total or 0
 
 
 # ============================================================
-# RESOURCES
+# RESOURCE: CATEGORIES
 # ============================================================
 
 @mcp.resource(
@@ -189,23 +249,22 @@ def summarise(
     mime_type="application/json"
 )
 def categories():
-    """
-    Provides the available expense categories.
-    """
 
     with open(
         FILE_PATH,
         "r",
         encoding="utf-8"
     ) as f:
+
         return f.read()
 
 
+# ============================================================
+# RESOURCE: SERVER INFO
+# ============================================================
+
 @mcp.resource("info://server")
 def about_server():
-    """
-    Get information about the server.
-    """
 
     return {
         "name": "Expense Tracker",
@@ -234,6 +293,7 @@ def about_server():
 # ============================================================
 
 if __name__ == "__main__":
+
     mcp.run(
         transport="http",
         host="0.0.0.0",
